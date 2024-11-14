@@ -10,6 +10,8 @@ import time
 from abc import abstractmethod
 from enum import auto
 
+import tracemalloc
+
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
 except Exception:
@@ -183,6 +185,21 @@ class HordeProcess(abc.ABC):
             time_elapsed=None,
             ram_usage_bytes=psutil.Process().memory_info().rss,
         )
+
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics("lineno")
+
+        logger.info("\n=== TOP MEMORY ALLOCATIONS ===")
+        for stat in top_stats[:10]:
+            logger.info(f"{stat.count} allocations: {stat.size / 1024 / 1024:.1f} MB")
+            logger.info(f"    {stat.traceback}")
+
+        # Get current and peak traced memory
+        current, peak = tracemalloc.get_traced_memory()
+        logger.info(f"\nTracemalloc Stats:")
+        logger.info(f"Current traced memory: {current / 1024 / 1024:.1f} MB")
+        logger.info(f"Peak traced memory: {peak / 1024 / 1024:.1f} MB")
+
 
         try:
             if include_vram:

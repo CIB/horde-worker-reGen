@@ -11,6 +11,10 @@ from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 
+import tracemalloc
+
+tracemalloc.start()
+
 
 def start_inference_process(
     process_id: int,
