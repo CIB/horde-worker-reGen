@@ -11,6 +11,7 @@ from abc import abstractmethod
 from enum import auto
 
 import tracemalloc
+import torch
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -243,12 +244,14 @@ class HordeProcess(abc.ABC):
         """
         return
 
-    def main_loop(self) -> None:
+    def main_loop(self, prof) -> None:
         """Start the main loop of the process."""
         signal.signal(signal.SIGINT, signal_handler)
 
         while not self._end_process:
             time.sleep(self._loop_interval)
+            print(prof.key_averages().table(
+                sort_by="self_cuda_memory_usage", row_limit=10))
             self.receive_and_handle_control_messages()
             self.worker_cycle()
 

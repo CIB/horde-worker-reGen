@@ -13,6 +13,8 @@ from horde_worker_regen.process_management._aliased_types import ProcessQueue
 
 import tracemalloc
 
+import torch
+
 tracemalloc.start()
 
 
@@ -45,74 +47,83 @@ def start_inference_process(
         amd_gpu (bool, optional): If true, the process will attempt to use AMD GPU-specific optimisations.
             Defaults to False.
     """
-    with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
-        logger.remove()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
+            logger.remove()
 
-        try:
-            import hordelib
-            from hordelib.utils.logger import HordeLog
+            try:
+                import hordelib
+                from hordelib.utils.logger import HordeLog
 
-            HordeLog.initialise(
-                setup_logging=True,
-                process_id=process_id,
-                verbosity_count=5,  # FIXME
-            )
-
-            logger.debug(
-                f"Initialising hordelib with process_id={process_id}, high_memory_mode={high_memory_mode} "
-                f"and amd_gpu={amd_gpu}",
-            )
-
-            extra_comfyui_args = ["--disable-smart-memory"]
-
-            if amd_gpu:
-                extra_comfyui_args.append("--use-pytorch-cross-attention")
-
-            models_not_to_force_load = ["flux"]
-
-            if very_high_memory_mode:
-                extra_comfyui_args.append("--gpu-only")
-            elif high_memory_mode:
-                extra_comfyui_args.append("--normalvram")
-                models_not_to_force_load.extend(
-                    [
-                        "cascade",
-                    ],
-                )
-            elif low_memory_mode:
-                extra_comfyui_args.append("--novram")
-                models_not_to_force_load.extend(
-                    [
-                        "sdxl",
-                        "cascade",
-                    ],
-                )
-
-            with logger.catch(reraise=True):
-                hordelib.initialise(
-                    setup_logging=None,
+                HordeLog.initialise(
+                    setup_logging=True,
                     process_id=process_id,
-                    logging_verbosity=0,
-                    force_normal_vram_mode=False,
-                    models_not_to_force_load=models_not_to_force_load,
-                    extra_comfyui_args=extra_comfyui_args,
+                    verbosity_count=5,  # FIXME
                 )
-        except Exception as e:
-            logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
-            sys.exit(1)
 
-        from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
+                logger.debug(
+                    f"Initialising hordelib with process_id={process_id}, high_memory_mode={high_memory_mode} "
+                    f"and amd_gpu={amd_gpu}",
+                )
 
-        worker_process = HordeInferenceProcess(
-            process_id=process_id,
-            process_message_queue=process_message_queue,
-            pipe_connection=pipe_connection,
-            inference_semaphore=inference_semaphore,
-            disk_lock=disk_lock,
-            aux_model_lock=aux_model_lock,
-        )
+                extra_comfyui_args = ["--disable-smart-memory"]
 
-        worker_process.main_loop()
+                if amd_gpu:
+                    extra_comfyui_args.append("--use-pytorch-cross-attention")
+
+                models_not_to_force_load = ["flux"]
+
+                if very_high_memory_mode:
+                    extra_comfyui_args.append("--gpu-only")
+                elif high_memory_mode:
+                    extra_comfyui_args.append("--normalvram")
+                    models_not_to_force_load.extend(
+                        [
+                            "cascade",
+                        ],
+                    )
+                elif low_memory_mode:
+                    extra_comfyui_args.append("--novram")
+                    models_not_to_force_load.extend(
+                        [
+                            "sdxl",
+                            "cascade",
+                        ],
+                    )
+
+                with logger.catch(reraise=True):
+                    hordelib.initialise(
+                        setup_logging=None,
+                        process_id=process_id,
+                        logging_verbosity=0,
+                        force_normal_vram_mode=False,
+                        models_not_to_force_load=models_not_to_force_load,
+                        extra_comfyui_args=extra_comfyui_args,
+                    )
+            except Exception as e:
+                logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
+                sys.exit(1)
+
+            from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
+
+            worker_process = HordeInferenceProcess(
+                process_id=process_id,
+                process_message_queue=process_message_queue,
+                pipe_connection=pipe_connection,
+                inference_semaphore=inference_semaphore,
+                disk_lock=disk_lock,
+                aux_model_lock=aux_model_lock,
+            )
+
+            worker_process.main_loop(prof)
 
 
 def start_safety_process(
