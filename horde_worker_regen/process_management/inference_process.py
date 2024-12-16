@@ -40,6 +40,118 @@ from horde_worker_regen.process_management.messages import (
     ModelLoadState,
 )
 
+import psutil
+import torch
+from datetime import datetime
+import csv
+import os
+from typing import Dict, Any
+
+class WorkerMemoryTracker:
+    def __init__(self, worker_id: str):
+        self.worker_id = worker_id
+        os.makedirs("logs", exist_ok=True)
+        self.csv_filename = f"logs/worker_{worker_id}_memory_.csv"
+        self._init_csv()
+    
+    def _init_csv(self):
+        headers = [
+            'timestamp', 'label', 'system_ram_total', 'system_ram_used', 
+            'system_ram_free', 'system_ram_reserved', 'system_ram_percent',
+            'system_swap_used', 'process_rss', 'process_vms', 'process_shared',
+            'cuda_allocated', 'cuda_reserved', 'cuda_max_allocated',
+            'memory_heap', 'memory_stack', 'memory_cuda', 'memory_anonymous',
+            'memory_pytorch', 'memory_other'
+        ]
+        with open(self.csv_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+    def get_memory_snapshot(self) -> Dict[str, Any]:
+        process = psutil.Process()
+        memory_maps = process.memory_maps()
+        vm = psutil.virtual_memory()
+        
+        memory_by_type = {
+            'heap': 0,
+            'stack': 0,
+            'cuda': 0,
+            'anonymous': 0,
+            'pytorch': 0,
+            'other': 0
+        }
+        
+        for mm in memory_maps:
+            path = mm.path.lower()
+            if '[heap]' in path:
+                memory_by_type['heap'] += mm.rss
+            elif '[stack]' in path:
+                memory_by_type['stack'] += mm.rss
+            elif 'cuda' in path or 'nvidia' in path:
+                memory_by_type['cuda'] += mm.rss
+            elif '[anon]' in path:
+                memory_by_type['anonymous'] += mm.rss
+            elif 'torch' in path:
+                memory_by_type['pytorch'] += mm.rss
+            else:
+                memory_by_type['other'] += mm.rss
+
+        memory_by_type = {k: v / (1024 * 1024) for k, v in memory_by_type.items()}
+        
+        return {
+            'timestamp': datetime.now().timestamp(),
+            'system': {
+                'ram_total': vm.total / (1024 * 1024),
+                'ram_used': vm.used / (1024 * 1024),
+                'ram_free': vm.available / (1024 * 1024),
+                'ram_reserved': (vm.total - vm.available) / (1024 * 1024),
+                'ram_percent': vm.percent,
+                'swap_used': psutil.swap_memory().used / (1024 * 1024)
+            },
+            'process': {
+                'rss': process.memory_info().rss / (1024 * 1024),
+                'vms': process.memory_info().vms / (1024 * 1024),
+                'shared': getattr(process.memory_info(), 'shared', 0) / (1024 * 1024)
+            },
+            'torch': {
+                'cuda_allocated': torch.cuda.memory_allocated() / (1024 * 1024),
+                'cuda_reserved': torch.cuda.memory_reserved() / (1024 * 1024),
+                'cuda_max_allocated': torch.cuda.max_memory_allocated() / (1024 * 1024)
+            },
+            'memory_by_type': memory_by_type
+        }
+
+    def log_snapshot(self, label: str):
+        snapshot = self.get_memory_snapshot()
+        row = [
+            snapshot['timestamp'],
+            label,
+            snapshot['system']['ram_total'],
+            snapshot['system']['ram_used'],
+            snapshot['system']['ram_free'],
+            snapshot['system']['ram_reserved'],
+            snapshot['system']['ram_percent'],
+            snapshot['system']['swap_used'],
+            snapshot['process']['rss'],
+            snapshot['process']['vms'],
+            snapshot['process']['shared'],
+            snapshot['torch']['cuda_allocated'],
+            snapshot['torch']['cuda_reserved'],
+            snapshot['torch']['cuda_max_allocated'],
+            snapshot['memory_by_type']['heap'],
+            snapshot['memory_by_type']['stack'],
+            snapshot['memory_by_type']['cuda'],
+            snapshot['memory_by_type']['anonymous'],
+            snapshot['memory_by_type']['pytorch'],
+            snapshot['memory_by_type']['other']
+        ]
+        
+        with open(self.csv_filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+        
+        return snapshot
+
 if TYPE_CHECKING:
     from hordelib.horde import HordeLib, ProgressReport, ResultingImageReturn
     from hordelib.nodes.node_model_loader import HordeCheckpointLoader
@@ -77,6 +189,8 @@ class HordeInferenceProcess(HordeProcess):
     _active_model_name: str | None = None
     """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
     _aux_model_lock: Lock
+
+    memory_tracker: WorkerMemoryTracker
 
     def __init__(
         self,
@@ -169,6 +283,8 @@ class HordeInferenceProcess(HordeProcess):
             process_state=HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
         )
+
+        self.memory_tracker = WorkerMemoryTracker(str(self.process_id))
 
     def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
@@ -410,6 +526,8 @@ class HordeInferenceProcess(HordeProcess):
             info=f"Preloaded model {horde_model_name}",
         )
 
+        self.memory_tracker.log_snapshot(f"After Model Load - {horde_model_name}")
+
     _is_busy: bool = False
 
     _start_inference_time: float = 0.0
@@ -472,7 +590,9 @@ class HordeInferenceProcess(HordeProcess):
 
             with logger.catch(reraise=True):
                 self._start_inference_time = time.time()
+                self.memory_tracker.log_snapshot(f"Before Inference - Job {job_info.id_}")
                 results = self._horde.basic_inference(job_info, progress_callback=self.progress_callback)
+                self.memory_tracker.log_snapshot(f"After Inference - Job {job_info.id_}")
         except Exception as e:
             logger.critical(f"Inference failed: {type(e).__name__} {e}")
             return None
@@ -486,9 +606,10 @@ class HordeInferenceProcess(HordeProcess):
     @logger.catch(reraise=True)
     def unload_models_from_vram(self) -> None:
         """Unload all models from VRAM."""
+        self.memory_tracker.log_snapshot("Before VRAM Unload")
         from hordelib.comfy_horde import unload_all_models_vram
-
         unload_all_models_vram()
+        self.memory_tracker.log_snapshot("After VRAM Unload")
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
                 process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
@@ -509,9 +630,10 @@ class HordeInferenceProcess(HordeProcess):
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:
         """Unload all models from RAM."""
+        self.memory_tracker.log_snapshot("Before RAM Unload")
         from hordelib.comfy_horde import unload_all_models_ram
-
         unload_all_models_ram()
+        self.memory_tracker.log_snapshot("After RAM Unload")
         self.send_memory_report_message(include_vram=True)
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
@@ -641,6 +763,9 @@ class HordeInferenceProcess(HordeProcess):
             )
         elif isinstance(message, HordeInferenceControlMessage):
             if message.control_flag == HordeControlFlag.START_INFERENCE:
+                self.memory_tracker.log_snapshot(f"Start Job {message.sdk_api_job_info.id_}")
+                
+                time_start = time.time()
                 if self._active_model_name is None:
                     self.preload_model(
                         horde_model_name=message.horde_model_name,
@@ -668,8 +793,6 @@ class HordeInferenceProcess(HordeProcess):
                     process_state=HordeProcessState.INFERENCE_STARTING,
                     horde_model_state=ModelLoadState.IN_USE,
                 )
-
-                time_start = time.time()
 
                 results = self.start_inference(message.sdk_api_job_info)
 
@@ -704,6 +827,7 @@ class HordeInferenceProcess(HordeProcess):
                         process_state=HordeProcessState.WAITING_FOR_JOB,
                         info="Waiting for job",
                     )
+                    self.memory_tracker.log_snapshot(f"Complete Job {message.sdk_api_job_info.id_}")
                     return
 
                 process_state = HordeProcessState.INFERENCE_COMPLETE if results else HordeProcessState.INFERENCE_FAILED
@@ -714,10 +838,12 @@ class HordeInferenceProcess(HordeProcess):
                     results=results,
                     time_elapsed=time.time() - time_start,
                 )
+                self.memory_tracker.log_snapshot(f"Complete Job {message.sdk_api_job_info.id_}")
             else:
                 logger.critical(f"Received unexpected message: {message}")
                 return
         elif message.control_flag == HordeControlFlag.END_PROCESS:
+            self.memory_tracker.log_snapshot("Process Ending")
             self.send_process_state_change_message(
                 process_state=HordeProcessState.PROCESS_ENDING,
                 info="Process stopping",
